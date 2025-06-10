@@ -11,6 +11,10 @@ from io import StringIO
 app = Flask(__name__)
 CORS(app)
 
+@app.route('/')
+def home():
+    return 'Backend is live! Use /api/... endpoints.'
+
 def get_db_connection():
     return mysql.connector.connect(
         host="localhost",
