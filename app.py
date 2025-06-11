@@ -1,75 +1,65 @@
-from flask import Flask, request, jsonify, Response, send_file
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-import mysql.connector
+import sqlite3
 import requests
 import datetime
 import time
 from bs4 import BeautifulSoup
 import csv
 from io import StringIO
+import os
 
 app = Flask(__name__)
 CORS(app)
+
+DB_PATH = 'stock_db.sqlite'  # Change if needed
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row  # For dict-like access
+    return conn
 
 @app.route('/')
 def home():
     return 'Backend is live! Use /api/... endpoints.'
 
-def get_db_connection():
-    return mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="localhost",
-        database="stock_db"
-    )
-
-# GET all stocks
 @app.route('/api/stocks')
 def get_stocks():
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM stocks")
-        rows = cursor.fetchall()
-        cursor.close()
+        cursor = conn.execute("SELECT * FROM stocks")
+        rows = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return jsonify(rows)
     except Exception as e:
         print("[Get Stocks Error]", e)
         return jsonify({"error": str(e)}), 500
 
-# ADD a new stock
 @app.route('/api/stocks', methods=['POST'])
 def add_stock():
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
         symbol = request.json.get('symbol')
-        cursor.execute("INSERT IGNORE INTO stocks (symbol) VALUES (%s)", (symbol,))
+        conn.execute("INSERT OR IGNORE INTO stocks (symbol) VALUES (?)", (symbol,))
         conn.commit()
-        cursor.close()
         conn.close()
         return jsonify({"message": "Stock added"}), 201
     except Exception as e:
         print("[Add Stock Error]", e)
         return jsonify({"error": str(e)}), 500
 
-# DELETE a stock
 @app.route('/api/stocks/<symbol>', methods=['DELETE'])
 def delete_stock(symbol):
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM stocks WHERE symbol = %s", (symbol,))
+        conn.execute("DELETE FROM stocks WHERE symbol = ?", (symbol,))
         conn.commit()
-        cursor.close()
         conn.close()
         return jsonify({"message": "Stock deleted"})
     except Exception as e:
         print("[Delete Stock Error]", e)
         return jsonify({"error": str(e)}), 500
 
-# BUY or SELL shares
 @app.route('/api/stocks/<symbol>/shares', methods=['PUT'])
 def update_shares(symbol):
     try:
@@ -78,8 +68,7 @@ def update_shares(symbol):
         amount = int(data.get('amount'))
 
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT shares FROM stocks WHERE symbol = %s", (symbol,))
+        cursor = conn.execute("SELECT shares FROM stocks WHERE symbol = ?", (symbol,))
         stock = cursor.fetchone()
 
         if not stock:
@@ -91,27 +80,20 @@ def update_shares(symbol):
         if new_shares < 0:
             return jsonify({"error": "Not enough shares to sell"}), 400
 
-        cursor.execute("UPDATE stocks SET shares = %s WHERE symbol = %s", (new_shares, symbol))
+        conn.execute("UPDATE stocks SET shares = ? WHERE symbol = ?", (new_shares, symbol))
         conn.commit()
-        cursor.close()
         conn.close()
         return jsonify({"message": f"{action.capitalize()} successful", "shares": new_shares})
     except Exception as e:
         print("[Update Shares Error]", e)
         return jsonify({"error": str(e)}), 500
 
-# GET stock chart data
 @app.route('/api/stocks/<symbol>/chart', methods=['GET'])
 def get_stock_chart(symbol):
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT date, price FROM stock_prices
-            WHERE symbol = %s ORDER BY date
-        """, (symbol,))
+        cursor = conn.execute("SELECT date, price FROM stock_prices WHERE symbol = ? ORDER BY date", (symbol,))
         rows = cursor.fetchall()
-        cursor.close()
         conn.close()
 
         chart_data = {
@@ -123,12 +105,10 @@ def get_stock_chart(symbol):
         print("[Chart Data Error]", e)
         return jsonify({"error": str(e)}), 500
 
-# Convert date to UNIX
 def convert_to_unix(date_str):
     dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
     return int(time.mktime(dt.timetuple()))
 
-# Scrape Yahoo Finance for date range
 @app.route('/api/stocks/<symbol>/scrape-range', methods=['POST'])
 def scrape_from_yahoo(symbol):
     try:
@@ -150,7 +130,6 @@ def scrape_from_yahoo(symbol):
         rows = soup.select('table tbody tr')
 
         conn = get_db_connection()
-        cursor = conn.cursor()
         count = 0
 
         for row in rows:
@@ -162,36 +141,28 @@ def scrape_from_yahoo(symbol):
                     date_obj = datetime.datetime.strptime(date_text, "%b %d, %Y").date()
                     price = float(close_price)
 
-                    cursor.execute("""
+                    conn.execute("""
                         INSERT INTO stock_prices (symbol, date, price)
-                        VALUES (%s, %s, %s)
-                        ON DUPLICATE KEY UPDATE price = VALUES(price)
-                    """, (symbol.upper(), date_obj, price))
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(symbol, date) DO UPDATE SET price = excluded.price
+                    """, (symbol.upper(), str(date_obj), price))
                     count += 1
                 except:
                     continue
 
         conn.commit()
-        cursor.close()
         conn.close()
         return jsonify({"message": f"Scraped {count} records for {symbol.upper()}."})
-
     except Exception as e:
         print("[Scraping Error]", e)
         return jsonify({"error": "Scraping failed"}), 500
 
-# Export CSV
 @app.route('/api/stocks/<symbol>/export', methods=['GET'])
 def export_csv(symbol):
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT date, price FROM stock_prices
-            WHERE symbol = %s ORDER BY date ASC
-        """, (symbol,))
+        cursor = conn.execute("SELECT date, price FROM stock_prices WHERE symbol = ? ORDER BY date ASC", (symbol,))
         rows = cursor.fetchall()
-        cursor.close()
         conn.close()
 
         if not rows:
@@ -212,23 +183,19 @@ def export_csv(symbol):
         print("[Export CSV Error]", e)
         return jsonify({'error': 'Failed to export CSV'}), 500
 
-# Portfolio Summary
 @app.route('/api/report/summary', methods=['GET'])
 def get_portfolio_summary():
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute("SELECT SUM(shares) AS total_shares FROM stocks")
+        cursor = conn.execute("SELECT SUM(shares) AS total_shares FROM stocks")
         shares = cursor.fetchone()['total_shares'] or 0
 
-        cursor.execute("SELECT COUNT(*) AS total_stocks FROM stocks")
+        cursor = conn.execute("SELECT COUNT(*) AS total_stocks FROM stocks")
         stock_count = cursor.fetchone()['total_stocks']
 
-        cursor.execute("SELECT MAX(date) AS latest_date FROM stock_prices")
+        cursor = conn.execute("SELECT MAX(date) AS latest_date FROM stock_prices")
         latest_date = cursor.fetchone()['latest_date']
 
-        cursor.close()
         conn.close()
 
         return jsonify({
@@ -241,4 +208,6 @@ def get_portfolio_summary():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
+    if not os.path.exists(DB_PATH):
+        print("[INFO] SQLite database file not found. Please create it with required schema.")
     app.run(debug=True)
